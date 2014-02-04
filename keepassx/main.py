@@ -76,21 +76,49 @@ def do_list(args):
 def do_get(args):
     db = create_db(args)
     try:
-        entry = _search_for_entry(db, args.entry_id)[0]
+        entries = _search_for_entry(db, args.entry_id)
     except EntryNotFoundError as e:
         sys.stderr.write(str(e))
         sys.stderr.write("\n")
         return
-    default_fields = ['title', 'username', 'url', 'notes']
-    if args.entry_fields:
-        fields = args.entry_fields
-    else:
-        fields = default_fields
-    sys.stderr.write('\n')
-    for field in fields:
-        print("%-10s %s" % (field + ':', getattr(entry, field)))
+    t = PrettyTable(['#', 'Title', 'Username', 'URL'])
+    t.align['#'] = 'r'
+    t.align['Title'] = 'l'
+    t.align['Username'] = 'l'
+    t.align['URL'] = 'l'
+    for i, entry in enumerate(entries, start=1):
+        t.add_row([i, entry.title, entry.username, entry.url])
+    print(t)
+
+    selected = 0
+    if len(entries) > 1:
+        choice = None
+        while not choice:
+            try:
+                choice = int(raw_input('Which entry? '))
+                if choice < 1 or choice > len(entries):
+                    choice = None
+            except KeyboardInterrupt:
+                quit()
+            except:
+                choice = None
+        selected = choice - 1
+
+    entry = entries[selected]
+
     if args.clipboard_copy:
         clipboard.copy(entry.password)
+
+        if not args.quiet:
+            default_fields = ['title', 'username', 'url']
+            if args.entry_fields:
+                fields = args.entry_fields
+            else:
+                fields = default_fields
+            sys.stderr.write('\n')
+            for field in fields:
+                print("%-10s %s" % (field + ':', getattr(entry, field)))
+
         sys.stderr.write("\nPassword has been copied to clipboard.\n")
 
 
@@ -104,7 +132,7 @@ def _search_for_entry(db, term):
         except EntryNotFoundError:
             # Last try, do a fuzzy match and see if we come up
             # with anything.
-            entries = db.fuzzy_search_by_title(term)
+            entries = db.fuzzy_search_by_title(term, ignore_groups=["Backup"])
             if not entries:
                 raise EntryNotFoundError(
                     "Could not find an entry for: %s" % term)
@@ -145,6 +173,8 @@ def create_parser():
     get_parser.add_argument('-n', '--no-clipboard-copy', action="store_false",
                             dest="clipboard_copy", default=True,
                             help="Don't copy the password to the clipboard")
+    get_parser.add_argument('-q', '--quiet', default=False,
+                            action="store_true")
     get_parser.set_defaults(run=do_get)
     return parser
 
@@ -168,4 +198,8 @@ def main(args=None):
     parser = create_parser()
     args = _parse_args(parser, args)
     merge_config_file_values(args)
-    args.run(args)
+
+    try:
+        args.run(args)
+    except KeyboardInterrupt:
+        quit()
