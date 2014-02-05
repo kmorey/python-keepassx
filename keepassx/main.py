@@ -171,14 +171,14 @@ def _search_for_entry(db, term):
             return _filter_entries(entries, ignore_groups)
         # Case insensitive matches next.
         title_lower = title.lower()
-        for entry in entries:
+        for entry in db_entries:
             if _get_title(entry).lower() == title.lower():
                 entries.append(entry)
         if entries:
             return _filter_entries(entries, ignore_groups)
         # Subsequence/prefix matches next.
-        for entry in entries:
-            if _is_subsequence(title_lower, _get_title(entry).lower()):
+        for entry in db_entries:
+            if title_lower in _get_title(entry).lower():
                 entries.append(entry)
         if entries:
             return _filter_entries(entries, ignore_groups)
@@ -205,15 +205,6 @@ def _search_for_entry(db, term):
             return entries
         return [entry for entry in entries if entry.getparent().Name
                 not in ignore_groups]
-
-    def _is_subsequence(short_str, full_str):
-        current_index = 0
-        for i in range(len(full_str)):
-            if short_str[current_index] == full_str[i]:
-                current_index += 1
-            if current_index == len(short_str):
-                return True
-        return False
 
     # Do a fuzzy match and see if we come up with anything.
     entries = fuzzy_search_by_title(term, ignore_groups=["Backup"])
