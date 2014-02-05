@@ -1,3 +1,5 @@
 keepassx.egg-info/
 _build/
 .cache
+build
+dist

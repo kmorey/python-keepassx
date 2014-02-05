@@ -1,12 +1,14 @@
 import sys
 import os
 import argparse
+import difflib
 import getpass
-
+import keepass
 import yaml
+from contextlib import contextmanager
+from itertools import chain
 from prettytable import PrettyTable
 
-from keepassx.db import Database, EntryNotFoundError
 from keepassx import clipboard
 from keepassx import __version__
 
@@ -14,80 +16,84 @@ from keepassx import __version__
 CONFIG_FILENAME = os.path.expanduser('~/.kpconfig')
 
 
-def open_db_file(args):
+class EntryNotFoundError(Exception):
+    pass
+
+
+class MultiDict(dict):
+    def __setitem__(self, key, value):
+        if not key in self:
+            super(MultiDict, self).__setitem__(key, [])
+        self.get(key).append(value)
+
+
+@contextmanager
+def create_db(args):
+    db_file = None
+    key_file = None
     if args.db_file is not None:
-        db_file = args.db_file
+        db_file = os.path.expanduser(args.db_file)
     elif 'KP_DB_FILE' in os.environ:
-        db_file = os.environ['KP_DB_FILE']
+        db_file = os.path.expanduser(os.environ['KP_DB_FILE'])
     else:
         sys.stderr.write("Must supply a db filename.\n")
         sys.exit(1)
-    return open(os.path.expanduser(db_file), 'rb')
 
-
-def open_key_file(args):
     if args.key_file is not None:
-        key_file = args.key_file
+        key_file = os.path.expanduser(args.key_file)
     elif 'KP_KEY_FILE' in os.environ:
-        key_file = os.environ['KP_KEY_FILE']
-    else:
-        # A keyfile is optional so None can just be returned.
-        return None
-    return open(os.path.expanduser(key_file), 'rb')
+        key_file = os.path.expanduser(os.environ['KP_KEY_FILE'])
 
-
-def create_db(args):
-    if 'KP_INSECURE_PASSWORD' in os.environ:
-        # This env var is really intended for testing purposes.
-        # No one should be using this var.
-        password = os.environ['KP_INSECURE_PASSWORD']
-    else:
-        password = getpass.getpass('Password: ')
-    db_file = open_db_file(args)
-    key_file = open_key_file(args)
-    if key_file is not None:
-        key_file_contents = key_file.read()
-    else:
-        # A key file is optional, so it's ok if no key file
-        # was specified.
-        key_file_contents = None
-    db = Database(db_file.read(), password=password,
-                  key_file_contents=key_file_contents)
-    return db
+    password = getpass.getpass('Password: ')
+    with keepass.open(db_file, password=password, keyfile=key_file) as kdb:
+        yield kdb
 
 
 def do_list(args):
-    db = create_db(args)
-    print("Entries:\n")
-    t = PrettyTable(['Title', 'Uuid', 'GroupName'])
-    t.align['Title'] = 'l'
-    t.align['GroupName'] = 'l'
-    if args.term is None:
-        entries = sorted(db.entries, key=lambda x: x.title.lower())
-    else:
-        entries = _search_for_entry(db, args.term)
-    for entry in entries:
-        if entry.group.group_name == 'Backup':
-            continue
-        t.add_row([entry.title, entry.uuid, entry.group.group_name])
-    print(t)
+    with create_db(args) as db:
+        print("Entries:\n")
+        t = PrettyTable(['Title', 'User Name', 'Group'])
+        t.align['Title'] = 'l'
+        t.align['GroupName'] = 'l'
+        if args.term is None:
+            db_entries = db.obj_root.findall('.//Entry')
+            entries = sorted(
+                db_entries, key=lambda x: _find_string(x, 'Title').lower()
+            )
+        else:
+            entries = _search_for_entry(db, args.term)
+        for entry in entries:
+            group_name = entry.getparent()['Name']
+            if group_name == 'Backup':
+                continue
+            t.add_row([
+                _find_string(entry, 'Title'),
+                _find_string(entry, 'UserName'),
+                group_name
+            ])
+        print(t)
 
 
 def do_get(args):
-    db = create_db(args)
-    try:
-        entries = _search_for_entry(db, args.entry_id)
-    except EntryNotFoundError as e:
-        sys.stderr.write(str(e))
-        sys.stderr.write("\n")
-        return
+    with create_db(args) as db:
+        try:
+            entries = _search_for_entry(db, args.entry_id)
+        except EntryNotFoundError as e:
+            sys.stderr.write(str(e))
+            sys.stderr.write("\n")
+            return
     t = PrettyTable(['#', 'Title', 'Username', 'URL'])
     t.align['#'] = 'r'
     t.align['Title'] = 'l'
     t.align['Username'] = 'l'
     t.align['URL'] = 'l'
     for i, entry in enumerate(entries, start=1):
-        t.add_row([i, entry.title, entry.username, entry.url])
+        t.add_row([
+            i,
+            _find_string(entry, 'Title'),
+            _find_string(entry, 'UserName'),
+            _find_string(entry, 'URL')
+        ])
     print(t)
 
     selected = 0
@@ -107,7 +113,7 @@ def do_get(args):
     entry = entries[selected]
 
     if args.clipboard_copy:
-        clipboard.copy(entry.password)
+        clipboard.copy(_find_password(entry))
 
         if not args.quiet:
             default_fields = ['title', 'username', 'url']
@@ -117,25 +123,102 @@ def do_get(args):
                 fields = default_fields
             sys.stderr.write('\n')
             for field in fields:
-                print("%-10s %s" % (field + ':', getattr(entry, field)))
+                print("%-10s %s" % (field + ':', _find_string(entry, field)))
 
         sys.stderr.write("\nPassword has been copied to clipboard.\n")
 
 
+def _find_password(entry):
+    for s in entry.String:
+        if s.Key == 'Password':
+            return str(s.Value)
+    return None
+
+
+def _find_string(entry, key):
+    for s in entry.String:
+        if str(s.Key).lower() == str(key).lower():
+            return str(s.Value)
+    return None
+
+
 def _search_for_entry(db, term):
-    entries = None
-    try:
-        entries = [db.find_by_uuid(term)]
-    except EntryNotFoundError:
-        try:
-            entries = [db.find_by_title(term)]
-        except EntryNotFoundError:
-            # Last try, do a fuzzy match and see if we come up
-            # with anything.
-            entries = db.fuzzy_search_by_title(term, ignore_groups=["Backup"])
-            if not entries:
-                raise EntryNotFoundError(
-                    "Could not find an entry for: %s" % term)
+    def fuzzy_search_by_title(title, ignore_groups=None):
+        """Find an entry by by fuzzy match.
+
+        This will check things such as:
+
+            * case insensitive matching
+            * typo checks
+            * prefix matches
+
+        If the ``ignore_groups`` argument is provided, then any matching
+        entries in the ``ignore_groups`` list will not be returned.  This
+        argument can be used to filter out groups you are not interested in.
+
+        Returns a list of matches (an empty list is returned if no matches are
+        found).
+
+        """
+        entries = []
+        db_entries = db.obj_root.findall('.//Entry')
+
+        # Exact matches trump
+        for entry in db_entries:
+            if _get_title(entry) == title:
+                entries.append(entry)
+        if entries:
+            return _filter_entries(entries, ignore_groups)
+        # Case insensitive matches next.
+        title_lower = title.lower()
+        for entry in entries:
+            if _get_title(entry).lower() == title.lower():
+                entries.append(entry)
+        if entries:
+            return _filter_entries(entries, ignore_groups)
+        # Subsequence/prefix matches next.
+        for entry in entries:
+            if _is_subsequence(title_lower, _get_title(entry).lower()):
+                entries.append(entry)
+        if entries:
+            return _filter_entries(entries, ignore_groups)
+        # Finally close matches that might have mispellings.
+        entry_map = MultiDict()
+        for entry in db_entries:
+            entry_map[_get_title(entry).lower()] = entry
+        matches = difflib.get_close_matches(
+            title.lower(), entry_map.keys(), cutoff=0.7)
+        if matches:
+            return _filter_entries(
+                list(
+                    chain.from_iterable([entry_map[name] for name in matches])
+                ),
+                ignore_groups
+            )
+        return []
+
+    def _get_title(entry):
+        return _find_string(entry, 'Title')
+
+    def _filter_entries(entries, ignore_groups):
+        if ignore_groups is None:
+            return entries
+        return [entry for entry in entries if entry.getparent().Name
+                not in ignore_groups]
+
+    def _is_subsequence(short_str, full_str):
+        current_index = 0
+        for i in range(len(full_str)):
+            if short_str[current_index] == full_str[i]:
+                current_index += 1
+            if current_index == len(short_str):
+                return True
+        return False
+
+    # Do a fuzzy match and see if we come up with anything.
+    entries = fuzzy_search_by_title(term, ignore_groups=["Backup"])
+    if not entries:
+        raise EntryNotFoundError("Could not find an entry for: %s" % term)
     return entries
 
 
